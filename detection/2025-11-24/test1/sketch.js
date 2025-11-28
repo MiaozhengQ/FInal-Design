@@ -9,6 +9,10 @@ let playBtn;
 let poseReady = false;
 let pausedFreeze = false;
 
+// ✨ 新增：动态 canvas 尺寸
+let canvasWidth = 640;
+let canvasHeight = 480;
+
 const LANDMARKS = [
   "nose","leftEyeInner","leftEye","leftEyeOuter","rightEyeInner","rightEye","rightEyeOuter",
   "leftEar","rightEar","mouthLeft","mouthRight","leftShoulder","rightShoulder","leftElbow","rightElbow",
@@ -25,14 +29,19 @@ const POSE_CONNECTIONS = [
   [0,1],[1,3],[0,2],[2,4],[5,6],[5,7],[6,8],[7,9],[8,10]
 ];
 
+// 简化的关键点集合
+const CRITICAL_POINTS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+const CRITICAL_NAMES = ["nose", "left_shoulder", "right_shoulder", "left_elbow", "right_elbow", 
+                        "left_wrist", "right_wrist", "left_hip", "right_hip", "left_knee", "right_knee", "left_ankle", "right_ankle"];
+
 // 平滑相关
 let smoothedLandmarks = null;
-const SMOOTH_ALPHA_HIGH = 0.75;
-const SMOOTH_ALPHA_LOW = 0.90;
+const SMOOTH_ALPHA_HIGH = 0.3;   // 从 0.75 → 0.3（更快响应）
+const SMOOTH_ALPHA_LOW = 0.5;    // 从 0.90 → 0.5（更快响应）
 const VISIBILITY_THRESHOLD = 0.35;
 const TRAIL_MIN_DIST = 3;
 const MAX_JUMP_PX = 60;
-const HIST_LEN = 5;
+const HIST_LEN = 3;  // 降低：从 5 → 3
 const EWMA_ALPHA = 0.80;
 let historyBuffers = null;
 
@@ -40,12 +49,28 @@ let historyBuffers = null;
 let puppetTemplate = null;
 let boneLengths = null;
 let mirrorForced = null;
-let mirrorDecisionCounter = 0;
-const MIRROR_SWITCH_COUNT = 5;
-const MIRROR_ERROR_RATIO = 0.92;
 let currentTransform = null;
-const TRANSFORM_LERP = 0.4;
-const ALIGN_INDICES = [0, 5, 6, 11, 12, 23, 24];
+const TRANSFORM_LERP = 0.05;
+
+// ✨ 改进：仅用躯干关键点（最稳定）
+const ALIGN_INDICES = [
+  11, 12,  // 左右肩膀
+  23, 24,  // 左右髋部
+  25, 26,  // 左右膝盖（新增）
+  27, 28   // 左右踝部（新增）
+];
+
+// ⚡ 改进：镜像决策稳定化（玻璃态转换）
+let cachedMirrorDecision = false;
+let mirrorDecisionMade = false;
+let mirrorConsecutiveFrames = 0;
+let lastMirrorVote = null;
+const MIRROR_FRAMES_THRESHOLD = 30;  // 增加：从 20 → 30（更稳定）
+const MIRROR_HYSTERESIS = 1.15;  // ✨ 新增：玻璃态因子（防止频繁切换）
+
+let lastAlignErr = Infinity;
+let alignmentSkipCounter = 0;
+const ALIGNMENT_UPDATE_INTERVAL = 1;  // 从 4 → 1（每帧更新镜像决策）
 
 // 手动编辑相关
 let manualEditMode = false;
@@ -55,6 +80,19 @@ let manualDragging = false;
 let enableAutoAlign = true;
 let stableFrameCount = 0;
 const STABLE_FRAMES_THRESHOLD = 15;
+
+// Click-to-Set 模式
+let setupMode = false;
+let setupPointIdx = 0;
+
+// ⚡ 性能优化：帧跳过
+let frameCounter = 0;
+const POSE_SKIP_FRAMES = 0;  // 从 1 → 0（每帧推理）
+
+// 脚部相关
+const FOOT_INDICES = [27, 28, 29, 30, 31, 32];  // 踝部、脚跟、脚趾
+const FOOT_PARENT = [25, 26];  // 膝盖（脚部的父节点）
+let footPredictionBuffer = {};  // 脚部预测缓冲
 
 // ============ 辅助函数 ============
 function copyLandmarks(src) {
@@ -82,25 +120,49 @@ function computeSimilarityTransform(srcPts, dstPts) {
   }
   if (valid.length < 2) return null;
 
+  // ✨ 改进：计算中心点
   let sx=0, sy=0, dx=0, dy=0;
   for (const v of valid) { sx+=v.a.x; sy+=v.a.y; dx+=v.b.x; dy+=v.b.y; }
   const n = valid.length;
   const scx = sx / n, scy = sy / n, dcx = dx / n, dcy = dy / n;
 
-  let Sxx=0, Sxy=0, denom=0;
+  // ✨ 改进：使用更稳定的旋转+缩放计算
+  let sumSrcSq = 0, sumDotProd = 0;
+  let Hxx = 0, Hxy = 0, Hyx = 0, Hyy = 0;
+
   for (const v of valid) {
     const ax = v.a.x - scx, ay = v.a.y - scy;
     const bx = v.b.x - dcx, by = v.b.y - dcy;
-    Sxx += ax * bx + ay * by;
-    Sxy += ax * by - ay * bx;
-    denom += ax*ax + ay*ay;
+    
+    sumSrcSq += ax * ax + ay * ay;
+    sumDotProd += ax * bx + ay * by;
+    
+    Hxx += ax * bx;
+    Hxy += ax * by;
+    Hyx += ay * bx;
+    Hyy += ay * by;
   }
-  if (denom <= 1e-6) return null;
 
-  const angle = Math.atan2(Sxy, Sxx);
-  const scale = Sxx / denom;
-  const tx = dcx - scale * ( Math.cos(angle) * scx - Math.sin(angle) * scy );
-  const ty = dcy - scale * ( Math.sin(angle) * scx + Math.cos(angle) * scy );
+  // ✨ SVD：计算最优旋转
+  const trace = Hxx + Hyy;
+  const det = Hxx * Hyy - Hxy * Hyx;
+  
+  let angle = Math.atan2(Hyx - Hxy, Hxx + Hyy);
+  let scale = 1;
+  
+  if (sumSrcSq > 0) {
+    // 使用 Procrustes 分析计算缩放
+    const numerator = Math.sqrt(det * det + trace * trace);
+    scale = numerator / sumSrcSq;
+  }
+
+  // ✨ 防止异常缩放（0.5-2.0 范围）
+  scale = Math.max(0.5, Math.min(2.0, scale));
+
+  const cosR = Math.cos(angle);
+  const sinR = Math.sin(angle);
+  const tx = dcx - (cosR * scx - sinR * scy) * scale;
+  const ty = dcy - (sinR * scx + cosR * scy) * scale;
 
   return { scale, angle, tx, ty };
 }
@@ -112,22 +174,39 @@ function angDiff(a, b) {
   return d;
 }
 
-function applyTransformToPts(pts, T, doMirror=false, center=null) {
-  if (!T) return pts.map(p => p ? { x: p.x, y: p.y, v: p.v } : null);
-  const cosR = Math.cos(T.angle), sinR = Math.sin(T.angle);
-  const out = [];
-  for (const p of pts) {
-    if (!p) { out.push(null); continue; }
+function applyTransformToPts(pts, transform, isMirrored, centroid) {
+  if (!transform) return pts;
+
+  const { scale, angle, tx, ty } = transform;
+  const cosR = Math.cos(angle);
+  const sinR = Math.sin(angle);
+
+  return pts.map(p => {
+    if (!p) return null;
+    
     let x = p.x, y = p.y;
-    if (doMirror) x = center ? (2*center.x - x) : -x;
-    const nx = T.scale * (cosR * x - sinR * y) + T.tx;
-    const ny = T.scale * (sinR * x + cosR * y) + T.ty;
-    out.push({ x: nx, y: ny, v: p.v });
-  }
-  return out;
+
+    // ✨ 镜像处理（如果需要）
+    if (isMirrored && centroid) {
+      x = 2 * centroid.x - x;
+    }
+
+    // ✨ 应用旋转和缩放
+    const px = (x - centroid?.x ?? 0) * scale;
+    const py = (y - centroid?.y ?? 0) * scale;
+    const nx = cosR * px - sinR * py;
+    const ny = sinR * px + cosR * py;
+
+    return {
+      x: nx + tx,
+      y: ny + ty,
+      v: p.v
+    };
+  });
 }
 
-function enforceBoneConstraints(landmarks, connections, targetLengths, iterations = 2) {
+// ⚡ 优化：只在必要时调用约束（不是每帧都调）
+function enforceBoneConstraints(landmarks, connections, targetLengths, iterations = 1) {
   if (!landmarks || !connections || !targetLengths) return landmarks;
   
   const result = landmarks.map(p => p ? { x: p.x, y: p.y, v: p.v } : null);
@@ -161,9 +240,39 @@ function enforceBoneConstraints(landmarks, connections, targetLengths, iteration
 function alignToPuppet(srcLandmarks) {
   if (!puppetTemplate) return srcLandmarks;
 
-  const srcSel = ALIGN_INDICES.map(i => srcLandmarks[i] ? {x: srcLandmarks[i].x, y: srcLandmarks[i].y} : null);
-  const dstSel = ALIGN_INDICES.map(i => puppetTemplate[i] ? {x: puppetTemplate[i].x, y: puppetTemplate[i].y} : null);
+  // ✨ 简化：不使用脚部进行对齐（脚部不稳定）
+  // 只使用躯干+腿部关键点
+  const srcSel = [
+    srcLandmarks[11],  // 左肩
+    srcLandmarks[12],  // 右肩
+    srcLandmarks[23],  // 左髋
+    srcLandmarks[24],  // 右髋
+    srcLandmarks[25],  // 左膝
+    srcLandmarks[26]   // 右膝
+  ].map(lm => (lm && (lm.v ?? 0) >= 0.3) ? {x: lm.x, y: lm.y} : null);
 
+  const dstSel = [
+    puppetTemplate[11],
+    puppetTemplate[12],
+    puppetTemplate[23],
+    puppetTemplate[24],
+    puppetTemplate[25],
+    puppetTemplate[26]
+  ].map(lm => lm ? {x: lm.x, y: lm.y} : null);
+
+  const validCount = srcSel.filter(p => p !== null).length;
+  if (validCount < 3) {
+    // 回退到只用躯干
+    const srcSelTorso = [11, 12, 23, 24].map(i => srcLandmarks[i] ? {x: srcLandmarks[i].x, y: srcLandmarks[i].y} : null);
+    const dstSelTorso = [11, 12, 23, 24].map(i => puppetTemplate[i] ? {x: puppetTemplate[i].x, y: puppetTemplate[i].y} : null);
+    return alignToPuppetWithPoints(srcLandmarks, srcSelTorso, dstSelTorso);
+  }
+
+  return alignToPuppetWithPoints(srcLandmarks, srcSel, dstSel);
+}
+
+// ✨ 改进对齐逻辑
+function alignToPuppetWithPoints(srcLandmarks, srcSel, dstSel) {
   const Tnm = computeSimilarityTransform(srcSel, dstSel);
   
   let centroid = null;
@@ -173,51 +282,125 @@ function alignToPuppet(srcLandmarks) {
     if (cnt) centroid = { x: sx/cnt, y: sy/cnt };
   }
   
-  const srcSelMir = srcSel.map(p => p ? { x: (centroid ? 2*centroid.x - p.x : -p.x), y: p.y } : null);
+  const srcSelMir = srcSel.map(p => p ? { x: (centroid ? 2*centroid.x - p.x : p.x), y: p.y } : null);
   const Tm = computeSimilarityTransform(srcSelMir, dstSel);
 
-  const srcAll = srcLandmarks.map(p => p ? {x:p.x,y:p.y} : null);
+  const srcAll = srcLandmarks.map(p => p ? {x:p.x,y:p.y,v:p.v} : null);
   let errNM = Infinity, errM = Infinity;
+  
   if (Tnm) {
-    const trgNM = applyTransformToPts(srcAll, Tnm, false);
-    errNM = computeMatchError(trgNM, puppetTemplate);
+    const trgNM = applyTransformToPts(srcAll, Tnm, false, centroid);
+    errNM = 0;
+    let cnt = 0;
+    for (let i = 0; i < trgNM.length; i++) {
+      const a = trgNM[i], b = puppetTemplate[i];
+      if (!a || !b) continue;
+      if ((a.v ?? 0) >= VISIBILITY_THRESHOLD) {
+        const dx = a.x - b.x, dy = a.y - b.y;
+        errNM += dx*dx + dy*dy;
+        cnt++;
+      }
+    }
+    errNM = cnt ? errNM / cnt : Infinity;
   }
+  
   if (Tm) {
-    const trgM = applyTransformToPts(srcAll, Tm, false, null);
-    errM = computeMatchError(trgM, puppetTemplate);
+    const trgM = applyTransformToPts(srcAll, Tm, false, centroid);
+    errM = 0;
+    let cnt = 0;
+    for (let i = 0; i < trgM.length; i++) {
+      const a = trgM[i], b = puppetTemplate[i];
+      if (!a || !b) continue;
+      if ((a.v ?? 0) >= VISIBILITY_THRESHOLD) {
+        const dx = a.x - b.x, dy = a.y - b.y;
+        errM += dx*dx + dy*dy;
+        cnt++;
+      }
+    }
+    errM = cnt ? errM / cnt : Infinity;
   }
 
-  let decidedMirror = null;
-  if (mirrorForced === true) decidedMirror = true;
-  else if (mirrorForced === false) decidedMirror = false;
-  else {
-    let preferMirror = (errM < errNM * MIRROR_ERROR_RATIO);
-    if (preferMirror) mirrorDecisionCounter = Math.min(mirrorDecisionCounter + 1, MIRROR_SWITCH_COUNT);
-    else mirrorDecisionCounter = Math.max(mirrorDecisionCounter - 1, -MIRROR_SWITCH_COUNT);
-    if (mirrorDecisionCounter >= MIRROR_SWITCH_COUNT) decidedMirror = true;
-    else if (mirrorDecisionCounter <= -MIRROR_SWITCH_COUNT) decidedMirror = false;
-    else decidedMirror = (mirrorDecisionCounter > 0);
+  // ✨ 改进：玻璃态镜像决策（防止频繁切换）
+  if (!mirrorDecisionMade) {
+    if (mirrorForced === true) {
+      cachedMirrorDecision = true;
+      mirrorDecisionMade = true;
+      console.log('✓ Mirror forced: MIRRORED');
+    } else if (mirrorForced === false) {
+      cachedMirrorDecision = false;
+      mirrorDecisionMade = true;
+      console.log('✓ Mirror forced: NORMAL');
+    } else {
+      // ✨ 玻璃态：已镜像时需要 errNM < errM * 0.85 才能切换回正常
+      //         已正常时需要 errM < errNM * 1.15 才能切换到镜像
+      const shouldBeMirrored = cachedMirrorDecision 
+        ? (errM < errNM * 0.85)  // 镜像状态下的切换阈值（更严格）
+        : (errM < errNM * MIRROR_HYSTERESIS);  // 正常状态下的切换阈值
+      
+      const currentVote = shouldBeMirrored ? 'mirrored' : 'normal';
+      
+      if (currentVote === lastMirrorVote) {
+        mirrorConsecutiveFrames++;
+      } else {
+        mirrorConsecutiveFrames = 1;
+        lastMirrorVote = currentVote;
+      }
+      
+      if (mirrorConsecutiveFrames >= MIRROR_FRAMES_THRESHOLD) {
+        const oldDecision = cachedMirrorDecision;
+        cachedMirrorDecision = (currentVote === 'mirrored');
+        mirrorDecisionMade = true;
+        
+        if (oldDecision !== cachedMirrorDecision) {
+          console.log(`✓ Mirror locked: ${cachedMirrorDecision ? 'MIRRORED' : 'NORMAL'} (errNM=${errNM.toFixed(1)}, errM=${errM.toFixed(1)}, ratio=${(errM/errNM).toFixed(2)})`);
+        }
+      }
+    }
+  } else if (mirrorDecisionMade && !mirrorForced) {
+    // ✨ 已决策后，继续监控以便重新评估（但保持玻璃态）
+    const shouldBeMirrored = cachedMirrorDecision 
+      ? (errM < errNM * 0.85)
+      : (errM < errNM * MIRROR_HYSTERESIS);
+    
+    const currentVote = shouldBeMirrored ? 'mirrored' : 'normal';
+    
+    if (currentVote !== lastMirrorVote) {
+      mirrorConsecutiveFrames = 1;
+      lastMirrorVote = currentVote;
+    } else {
+      mirrorConsecutiveFrames++;
+    }
+    
+    // ✨ 只有在连续超过阈值两倍时才切换（更稳定）
+    if (mirrorConsecutiveFrames >= MIRROR_FRAMES_THRESHOLD * 2) {
+      const oldDecision = cachedMirrorDecision;
+      cachedMirrorDecision = (currentVote === 'mirrored');
+      
+      if (oldDecision !== cachedMirrorDecision) {
+        console.log(`⚠️ Mirror RE-LOCKED: ${cachedMirrorDecision ? 'MIRRORED' : 'NORMAL'}`);
+        mirrorConsecutiveFrames = 0;
+        lastMirrorVote = null;
+      }
+    }
   }
 
-  const chosenT = decidedMirror ? Tm : Tnm;
+  const chosenT = cachedMirrorDecision ? Tm : Tnm;
   if (!chosenT) return srcLandmarks;
 
+  // ✨ 保守的变换更新（头部比较敏感）
   if (!currentTransform) {
     currentTransform = chosenT;
   } else {
-    currentTransform.scale = currentTransform.scale * (1 - TRANSFORM_LERP) + chosenT.scale * TRANSFORM_LERP;
-    currentTransform.tx = currentTransform.tx * (1 - TRANSFORM_LERP) + chosenT.tx * TRANSFORM_LERP;
-    currentTransform.ty = currentTransform.ty * (1 - TRANSFORM_LERP) + chosenT.ty * TRANSFORM_LERP;
+    const lerp = 0.12;  // 从 0.08 → 0.12（头部需要更快响应）
+    currentTransform.scale = currentTransform.scale * (1 - lerp) + chosenT.scale * lerp;
+    currentTransform.tx = currentTransform.tx * (1 - lerp) + chosenT.tx * lerp;
+    currentTransform.ty = currentTransform.ty * (1 - lerp) + chosenT.ty * lerp;
     const delta = angDiff(chosenT.angle, currentTransform.angle);
-    currentTransform.angle = currentTransform.angle + delta * TRANSFORM_LERP;
+    currentTransform.angle = currentTransform.angle + delta * lerp;
   }
 
-  let out = applyTransformToPts(srcLandmarks, currentTransform, decidedMirror, centroid);
-  
-  // 应用骨骼约束
-  if (boneLengths) {
-    out = enforceBoneConstraints(out, POSE_CONNECTIONS, boneLengths, 3);
-  }
+  // ✨ 应用变换
+  let out = applyTransformToPts(srcLandmarks, currentTransform, cachedMirrorDecision, centroid);
   
   return out;
 }
@@ -234,14 +417,22 @@ function findNearestIndex(x, y, list) {
   return { idx: best, d: bd };
 }
 
-// ============ setup ============
+// ============ setup（只保留一个） ============
 function setup() {
-  const cnv = createCanvas(640, 480);
+  const cnv = createCanvas(canvasWidth, canvasHeight);
   cnv.id('p5canvas');
 
   videoEl = createVideo();
-  videoEl.size(640, 480);
+  videoEl.size(canvasWidth, canvasHeight);
   videoEl.hide();
+
+  // ✅ 关键：预加载视频以减少延迟
+  videoEl.elt.muted = true;
+  videoEl.elt.autoplay = true;
+  videoEl.elt.playsInline = true;
+  videoEl.elt.setAttribute('playsinline', '');
+  videoEl.elt.preload = 'auto';
+  videoEl.elt.buffered;
 
   const fileInput = document.getElementById('videoFile');
   fileInput.addEventListener('change', (e) => {
@@ -249,11 +440,54 @@ function setup() {
     if (!file) return;
     trail = [];
     const url = URL.createObjectURL(file);
+    
+    videoEl.elt.pause();
+    videoEl.elt.muted = true;
+    videoEl.elt.playsInline = true;
+    videoEl.elt.preload = 'auto';
     videoEl.elt.src = url;
     videoEl.elt.load();
+
+    let loadAttempts = 0;
+    const tryPlay = () => {
+      loadAttempts++;
+      if (videoEl.elt.readyState >= 2) {
+        videoEl.elt.play().catch(err => {
+          if (loadAttempts < 5) setTimeout(tryPlay, 200);
+          console.warn('Autoplay blocked:', err);
+        });
+      } else if (loadAttempts < 5) {
+        setTimeout(tryPlay, 200);
+      }
+    };
+    
+    videoEl.elt.onloadeddata = tryPlay;
+    videoEl.elt.oncanplay = tryPlay;
+    videoEl.elt.onprogress = tryPlay;
+    
+    // ✨ 关键：视频加载时，动态调整 canvas 尺寸以保持原始比例
     videoEl.elt.onloadedmetadata = () => {
-      videoEl.elt.muted = true;
-      videoEl.elt.play().catch(err => console.warn('Autoplay blocked:', err));
+      const vW = videoEl.elt.videoWidth;
+      const vH = videoEl.elt.videoHeight;
+      
+      // 计算缩放比例（保持视频宽高比，最大宽度 1280）
+      const maxWidth = 1280;
+      if (vW > maxWidth) {
+        canvasHeight = Math.round(maxWidth * (vH / vW));
+        canvasWidth = maxWidth;
+      } else {
+        canvasWidth = vW;
+        canvasHeight = vH;
+      }
+      
+      console.log(`✓ Video size: ${vW}×${vH} → Canvas: ${canvasWidth}×${canvasHeight}`);
+      
+      // ✨ 调整 canvas 和 video 尺寸
+      resizeCanvas(canvasWidth, canvasHeight);
+      videoEl.size(canvasWidth, canvasHeight);
+      
+      tryPlay();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
   });
 
@@ -275,8 +509,8 @@ function setup() {
     if (!videoEl || !videoEl.elt) return;
     try {
       if (videoEl.elt.paused) {
-        videoEl.elt.muted = false;
         await videoEl.elt.play();
+        videoEl.elt.muted = false;
       } else {
         videoEl.elt.pause();
       }
@@ -292,8 +526,8 @@ function setup() {
     locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose@0.5/${file}`
   });
   pose.setOptions({
-    modelComplexity: 1,
-    smoothLandmarks: true,
+    modelComplexity: 0,
+    smoothLandmarks: false,
     enableSegmentation: false,
     minDetectionConfidence: 0.5,
     minTrackingConfidence: 0.5
@@ -308,12 +542,12 @@ function setup() {
   createManualControls();
 }
 
-// ============ onPoseResults ============
+// ============ onPoseResults（只保留一个） ============
 function onPoseResults(results) {
-  const vW = (videoEl && videoEl.elt && videoEl.elt.videoWidth) ? videoEl.elt.videoWidth : width;
-  const vH = (videoEl && videoEl.elt && videoEl.elt.videoHeight) ? videoEl.elt.videoHeight : height;
-  const scaleX = width / vW;
-  const scaleY = height / vH;
+  const vW = (videoEl && videoEl.elt && videoEl.elt.videoWidth) ? videoEl.elt.videoWidth : canvasWidth;
+  const vH = (videoEl && videoEl.elt && videoEl.elt.videoHeight) ? videoEl.elt.videoHeight : canvasHeight;
+  const scaleX = canvasWidth / vW;
+  const scaleY = canvasHeight / vH;
 
   if (results.poseLandmarks && results.poseLandmarks.length) {
     if (!smoothedLandmarks || smoothedLandmarks.length !== results.poseLandmarks.length) {
@@ -323,6 +557,7 @@ function onPoseResults(results) {
         v: lm.visibility ?? 1
       }));
       historyBuffers = smoothedLandmarks.map(() => ({ xs: [], ys: [], vs: [] }));
+      footPredictionBuffer = {};
     } else {
       for (let i = 0; i < results.poseLandmarks.length; i++) {
         const lm = results.poseLandmarks[i];
@@ -385,6 +620,10 @@ function onPoseResults(results) {
         });
         console.log(`✓ Template initialized (avgVis=${avgVis.toFixed(2)})`);
         stableFrameCount = 0;
+        mirrorDecisionMade = false;
+        mirrorConsecutiveFrames = 0;
+        lastMirrorVote = null;
+        cachedMirrorDecision = false;
       }
     }
 
@@ -392,6 +631,11 @@ function onPoseResults(results) {
     if (enableAutoAlign && puppetTemplate) {
       finalLandmarks = alignToPuppet(smoothedLandmarks);
     }
+    
+    if (finalLandmarks && enableAutoAlign) {
+      predictOccludedFeet();
+    }
+    
     resultsForDraw = { poseLandmarks: finalLandmarks };
   }
 
@@ -409,12 +653,69 @@ function onPoseResults(results) {
   }
 }
 
+// ✨ 改进：脚部遮挡预测（在对齐之后调用）
+function predictOccludedFeet() {
+  if (!smoothedLandmarks) return;
+
+  // ✨ 左脚和右脚分别处理
+  for (let side = 0; side < 2; side++) {
+    const isLeft = (side === 0);
+    const ankleIdx = isLeft ? 27 : 28;
+    const heelIdx = isLeft ? 29 : 30;
+    const footTipIdx = isLeft ? 31 : 32;
+    const kneeIdx = isLeft ? 25 : 26;
+
+    const ankle = smoothedLandmarks[ankleIdx];
+    const heel = smoothedLandmarks[heelIdx];
+    const footTip = smoothedLandmarks[footTipIdx];
+    const knee = smoothedLandmarks[kneeIdx];
+
+    // ✨ 只在脚跟或脚尖可见性低时预测
+    const heelVis = heel?.v ?? 0;
+    const footTipVis = footTip?.v ?? 0;
+
+    if ((heelVis < 0.35 || footTipVis < 0.35) && ankle && knee && (ankle.v ?? 0) >= 0.3) {
+      // 计算小腿方向向量
+      const legDx = ankle.x - knee.x;
+      const legDy = ankle.y - knee.y;
+      const legLen = Math.sqrt(legDx * legDx + legDy * legDy);
+
+      if (legLen > 5) {  // 有效的小腿长度
+        // 脚部方向：沿着小腿方向
+        const dirX = legDx / legLen;
+        const dirY = legDy / legLen;
+        
+        // 脚部总长度（约为小腿长度的 35%）
+        const footLen = legLen * 0.35;
+
+        // ✨ 脚跟预测：踝部下方 30% 脚长距离
+        if (heelVis < 0.35) {
+          heel.x = ankle.x + dirX * footLen * 0.3;
+          heel.y = ankle.y + dirY * footLen * 0.3;
+          heel.v = 0.5;  // 设为低可见性（这是预测值）
+        }
+
+        // ✨ 脚尖预测：踝部下方 100% 脚长距离
+        if (footTipVis < 0.35) {
+          footTip.x = ankle.x + dirX * footLen;
+          footTip.y = ankle.y + dirY * footLen;
+          footTip.v = 0.5;  // 设为低可见性（这是预测值）
+        }
+      }
+    }
+  }
+}
+
 // ============ draw ============
 function draw() {
   background(30);
 
+  // ⚡ 根据帧跳过配置调用 pose.send
   if (poseReady && videoEl && videoEl.elt && videoEl.elt.readyState >= 2 && !pausedFreeze) {
-    try { pose.send({image: videoEl.elt}); } catch (err) { console.error('pose.send:', err); }
+    if (frameCounter % (POSE_SKIP_FRAMES + 1) === 0) {
+      try { pose.send({image: videoEl.elt}); } catch (err) { console.error('pose.send:', err); }
+    }
+    frameCounter++;
   }
 
   if (videoEl && videoEl.elt && videoEl.elt.videoWidth > 0) {
@@ -446,6 +747,8 @@ function draw() {
     }
   }
 
+  // ✨ 注释掉红线轨迹绘制
+  /*
   noFill();
   strokeWeight(2);
   stroke(255, 0, 0, 200);
@@ -456,10 +759,11 @@ function draw() {
   endShape();
 
   if (trail.length > 0) {
-    fill(255, 200, 0);
+    fill(255,200,0);
     noStroke();
     ellipse(trail[trail.length - 1].x, trail[trail.length - 1].y, 10, 10);
   }
+  */
 
   // === 手动编辑模式显示 ===
   if (manualEditMode && puppetTemplate) {
@@ -498,7 +802,6 @@ function draw() {
   // === Click-to-Set 模式显示 ===
   if (setupMode && puppetTemplate) {
     push();
-    // 显示已设置的点（高亮关键点）
     noStroke();
     fill(0, 255, 100, 150);
     for (let i = 0; i < setupPointIdx; i++) {
@@ -509,7 +812,6 @@ function draw() {
       }
     }
     
-    // 显示十字光标
     stroke(255, 200, 0, 200);
     strokeWeight(1);
     line(mouseX - 15, mouseY, mouseX + 15, mouseY);
@@ -519,28 +821,33 @@ function draw() {
     fill(255, 200, 0);
     textSize(14);
     textAlign(CENTER, BOTTOM);
-    const currentPointName = CRITICAL_NAMES[setupPointIdx];
-    text(`${setupPointIdx + 1}/13: Click to set ${currentPointName}`, width / 2, 20);
+    const currentPointName = CRITICAL_NAMES[setupPointIdx] || "done";
+    text(`${setupPointIdx + 1}/${CRITICAL_POINTS.length}: Click to set ${currentPointName}`, width / 2, 20);
     
-    // 左下角显示已完成的点列表
     fill(200, 200, 200);
     textSize(10);
     textAlign(LEFT, TOP);
     let yPos = height - 100;
     text('✓ Completed:', 10, yPos);
-    for (let i = 0; i < setupPointIdx; i++) {
+    for (let i = 0; i < Math.min(setupPointIdx, CRITICAL_NAMES.length); i++) {
       yPos += 12;
       text(`${i + 1}. ${CRITICAL_NAMES[i]}`, 15, yPos);
     }
-    
     pop();
   }
 }
 
-// 修改 mousePressed 以支持 Click-to-Set
+// ============ 鼠标交互 ============
+function mouseMoved() {
+  if (!manualEditMode || !puppetTemplate) { manualHoverIndex = -1; return; }
+  const { idx, d } = findNearestIndex(mouseX, mouseY, puppetTemplate);
+  manualHoverIndex = (d < 30) ? idx : -1;
+}
+
 function mousePressed() {
   if (setupMode) {
     if (mouseX < 0 || mouseY < 0 || mouseX > width || mouseY > height) return;
+    if (setupPointIdx >= CRITICAL_POINTS.length) return;
     const pointIdx = CRITICAL_POINTS[setupPointIdx];
     puppetTemplate[pointIdx] = { x: mouseX, y: mouseY, v: 1 };
     console.log(`Set ${LANDMARKS[pointIdx]} (#${pointIdx}): (${Math.round(mouseX)}, ${Math.round(mouseY)})`);
@@ -552,6 +859,20 @@ function mousePressed() {
   if (mouseX < 0 || mouseY < 0 || mouseX > width || mouseY > height) return;
   const { idx, d } = findNearestIndex(mouseX, mouseY, puppetTemplate);
   if (idx >= 0 && d < 30) { manualSelectedIdx = idx; manualDragging = true; }
+}
+
+function mouseDragged() {
+  if (!manualEditMode || !manualDragging || manualSelectedIdx < 0 || !puppetTemplate) return;
+  puppetTemplate[manualSelectedIdx].x = constrain(mouseX, 0, width);
+  puppetTemplate[manualSelectedIdx].y = constrain(mouseY, 0, height);
+  boneLengths = POSE_CONNECTIONS.map(([a, b]) => {
+    const A = puppetTemplate[a], B = puppetTemplate[b];
+    return A && B ? dist(A.x, A.y, B.x, B.y) : null;
+  });
+}
+
+function mouseReleased() {
+  manualDragging = false;
 }
 
 // ============ 手动控制 UI ============
@@ -568,7 +889,6 @@ function createManualControls() {
   container.style.maxWidth = '350px';
   container.style.borderRadius = '4px';
 
-  // === 第一行：模板初始化选项 ===
   const row1 = document.createElement('div');
   row1.style.marginBottom = '8px';
 
@@ -580,14 +900,14 @@ function createManualControls() {
   row1.appendChild(label1);
 
   const freezeBtn = document.createElement('button');
-  freezeBtn.textContent = '1. Auto Freeze (from detect)';
+  freezeBtn.textContent = '1. Auto Freeze';
   freezeBtn.style.marginRight = '6px';
   freezeBtn.style.marginBottom = '4px';
   freezeBtn.style.padding = '4px 6px';
   freezeBtn.style.background = '#445';
   freezeBtn.onclick = () => {
     if (!resultsForDraw?.poseLandmarks && !smoothedLandmarks) {
-      alert('❌ No pose detected. Make sure video is playing.');
+      alert('❌ No pose detected.');
       return;
     }
     const src = resultsForDraw?.poseLandmarks || smoothedLandmarks;
@@ -596,13 +916,13 @@ function createManualControls() {
       const A = puppetTemplate[a], B = puppetTemplate[b];
       return A && B ? dist(A.x, A.y, B.x, B.y) : null;
     });
-    console.log('✓ Auto template frozen from detection');
-    alert('✓ Template frozen from current detection.\n\nNow use Manual Edit to adjust points to match puppet image.');
+    console.log('✓ Template frozen');
+    alert('✓ Template frozen. Use Manual Edit to adjust.');
   };
   row1.appendChild(freezeBtn);
 
   const manualSetBtn = document.createElement('button');
-  manualSetBtn.textContent = `2. Click-to-Set (${CRITICAL_POINTS.length} points)`;
+  manualSetBtn.textContent = `2. Click-to-Set`;
   manualSetBtn.style.padding = '4px 6px';
   manualSetBtn.style.background = '#544';
   manualSetBtn.onclick = () => {
@@ -610,27 +930,17 @@ function createManualControls() {
       puppetTemplate = Array(33).fill(null).map(() => ({ x: 0, y: 0, v: 1 }));
     }
     setupMode = !setupMode;
-    if (setupMode) setupPointIdx = 0; // 重置索引
+    if (setupMode) setupPointIdx = 0;
     manualSetBtn.style.background = setupMode ? '#655' : '#544';
-    manualSetBtn.textContent = setupMode ? `✓ Setting Mode ON (${setupPointIdx}/${CRITICAL_POINTS.length})` : `2. Click-to-Set (${CRITICAL_POINTS.length} points)`;
     if (setupMode) {
-      console.log(`🖱️ Click-to-Set mode: Only need to set ${CRITICAL_POINTS.length} critical points`);
-      alert(`Click-to-Set Mode Active!\n\nOnly need to click ${CRITICAL_POINTS.length} critical points:\n${CRITICAL_NAMES.join(', ')}\n\nPress ENTER when done, ESC to cancel.`);
+      alert(`Click ${CRITICAL_POINTS.length} points: ${CRITICAL_NAMES.join(', ')}`);
     }
   };
   row1.appendChild(manualSetBtn);
   container.appendChild(row1);
 
-  // === 第二行：对齐控制 ===
   const row2 = document.createElement('div');
   row2.style.marginBottom = '8px';
-
-  const label2 = document.createElement('span');
-  label2.textContent = '⚙️ Alignment:';
-  label2.style.fontWeight = 'bold';
-  label2.style.display = 'block';
-  label2.style.marginBottom = '4px';
-  row2.appendChild(label2);
 
   const alignToggle = document.createElement('button');
   alignToggle.textContent = `AutoAlign: ${enableAutoAlign ? 'ON' : 'OFF'}`;
@@ -641,7 +951,6 @@ function createManualControls() {
     enableAutoAlign = !enableAutoAlign;
     alignToggle.textContent = `AutoAlign: ${enableAutoAlign ? 'ON' : 'OFF'}`;
     alignToggle.style.background = enableAutoAlign ? '#4a4' : '#a44';
-    console.log(`AutoAlign ${enableAutoAlign ? 'enabled' : 'disabled'}`);
   };
   row2.appendChild(alignToggle);
 
@@ -651,7 +960,7 @@ function createManualControls() {
   manualToggle.style.background = '#545';
   manualToggle.onclick = () => {
     if (!puppetTemplate) {
-      alert('❌ Must set template first! Use "Auto Freeze" or "Click-to-Set"');
+      alert('❌ Set template first!');
       return;
     }
     manualEditMode = !manualEditMode;
@@ -661,27 +970,14 @@ function createManualControls() {
   row2.appendChild(manualToggle);
   container.appendChild(row2);
 
-  // === 第三行：导入/导出 ===
   const row3 = document.createElement('div');
-  row3.style.marginBottom = '8px';
-
-  const label3 = document.createElement('span');
-  label3.textContent = '💾 Save/Load:';
-  label3.style.fontWeight = 'bold';
-  label3.style.display = 'block';
-  label3.style.marginBottom = '4px';
-  row3.appendChild(label3);
-
   const expBtn = document.createElement('button');
   expBtn.textContent = 'Export';
   expBtn.style.marginRight = '6px';
   expBtn.style.padding = '4px 6px';
   expBtn.style.background = '#445';
   expBtn.onclick = () => {
-    if (!puppetTemplate) {
-      alert('No template to export');
-      return;
-    }
+    if (!puppetTemplate) { alert('No template'); return; }
     const data = { puppetTemplate, boneLengths };
     const a = document.createElement('a');
     a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(data, null, 2));
@@ -689,7 +985,6 @@ function createManualControls() {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    console.log('✓ Template exported');
   };
   row3.appendChild(expBtn);
 
@@ -697,7 +992,6 @@ function createManualControls() {
   impInput.type = 'file';
   impInput.accept = '.json';
   impInput.style.fontSize = '10px';
-  impInput.style.padding = '2px';
   impInput.onchange = (ev) => {
     const f = ev.target.files[0];
     if (!f) return;
@@ -708,13 +1002,10 @@ function createManualControls() {
         if (obj.puppetTemplate && Array.isArray(obj.puppetTemplate)) {
           puppetTemplate = obj.puppetTemplate;
           boneLengths = obj.boneLengths || null;
-          console.log('✓ Template imported');
-          alert('✓ Template imported successfully!');
-        } else {
-          alert('Invalid template format');
+          alert('✓ Imported');
         }
       } catch (err) {
-        alert('Parse error: ' + err.message);
+        alert('Error: ' + err.message);
       }
     };
     r.readAsText(f);
@@ -722,472 +1013,34 @@ function createManualControls() {
   row3.appendChild(impInput);
   container.appendChild(row3);
 
-  // === 第四行：重置 ===
-  const row4 = document.createElement('div');
-  const resetBtn = document.createElement('button');
-  resetBtn.textContent = 'Reset All';
-  resetBtn.style.padding = '4px 6px';
-  resetBtn.style.background = '#a44';
-  resetBtn.onclick = () => {
-    if (confirm('Reset all templates and settings?')) {
-      puppetTemplate = null;
-      boneLengths = null;
-      currentTransform = null;
-      setupMode = false;
-      setupPointIdx = 0;
-      manualEditMode = false;
-      enableAutoAlign = true;
-      stableFrameCount = 0;
-      console.log('✓ Reset complete');
-    }
-  };
-  row4.appendChild(resetBtn);
-  container.appendChild(row4);
-
-  // === 状态显示 ===
-  const statusDiv = document.createElement('div');
-  statusDiv.id = 'controlStatus';
-  statusDiv.style.fontSize = '10px';
-  statusDiv.style.color = '#aaa';
-  statusDiv.style.marginTop = '8px';
-  statusDiv.style.borderTop = '1px solid #555';
-  statusDiv.style.paddingTop = '4px';
-  statusDiv.textContent = '📊 Status: Ready';
-  container.appendChild(statusDiv);
-
   document.body.appendChild(container);
-
-  setInterval(() => {
-    if (setupMode) {
-      statusDiv.textContent = `🖱️ Setup Mode: ${setupPointIdx}/${CRITICAL_POINTS.length} points set`;
-      statusDiv.style.color = '#ff9';
-      // 更新按钮显示进度
-      manualSetBtn.textContent = `✓ Setting Mode ON (${setupPointIdx}/${CRITICAL_POINTS.length})`;
-    } else if (manualEditMode) {
-      statusDiv.textContent = '✏️ Manual Edit Mode: Drag points to adjust';
-      statusDiv.style.color = '#9ff';
-    } else if (puppetTemplate) {
-      statusDiv.textContent = `✓ Template ready | AutoAlign: ${enableAutoAlign ? 'ON' : 'OFF'}`;
-      statusDiv.style.color = '#9f9';
-    } else {
-      statusDiv.textContent = 'Status: Waiting for template setup';
-      statusDiv.style.color = '#f99';
-    }
-  }, 500);
 }
 
-// ============ 新增：简化的关键点集合 ============
-// 只需点击这 12 个关键点，其他点会自动从检测结果推导
-const CRITICAL_POINTS = [
-  0,   // nose
-  11,  // left_shoulder
-  12,  // right_shoulder
-  13,  // left_elbow
-  14,  // right_elbow
-  15,  // left_wrist
-  16,  // right_wrist
-  23,  // left_hip
-  24,  // right_hip
-  25,  // left_knee
-  26,  // right_knee
-  27,  // left_ankle
-  28   // right_ankle
-];
-
-const CRITICAL_NAMES = [
-  "nose",
-  "left_shoulder", "right_shoulder",
-  "left_elbow", "right_elbow",
-  "left_wrist", "right_wrist",
-  "left_hip", "right_hip",
-  "left_knee", "right_knee",
-  "left_ankle", "right_ankle"
-];
-
-// 修改 draw() 中添加 Click-to-Set 的可视反馈
-function draw() {
-  background(30);
-
-  if (poseReady && videoEl && videoEl.elt && videoEl.elt.readyState >= 2 && !pausedFreeze) {
-    try { pose.send({image: videoEl.elt}); } catch (err) { console.error('pose.send:', err); }
-  }
-
-  if (videoEl && videoEl.elt && videoEl.elt.videoWidth > 0) {
-    push();
-    image(videoEl, 0, 0, width, height);
-    pop();
-  }
-
-  const displayLandmarks = (manualEditMode && puppetTemplate) ? puppetTemplate : (resultsForDraw?.poseLandmarks);
-
-  if (displayLandmarks) {
-    stroke(0, 200, 255, 220);
-    strokeWeight(3);
-    for (let i = 0; i < POSE_CONNECTIONS.length; i++) {
-      const [aIdx, bIdx] = POSE_CONNECTIONS[i];
-      const a = displayLandmarks[aIdx];
-      const b = displayLandmarks[bIdx];
-      if (!a || !b) continue;
-      if ((a.v ?? 0) < VISIBILITY_THRESHOLD || (b.v ?? 0) < VISIBILITY_THRESHOLD) continue;
-      line(a.x, a.y, b.x, b.y);
-    }
-
-    noStroke();
-    fill(0, 255, 0);
-    for (let i = 0; i < displayLandmarks.length; i++) {
-      const lm = displayLandmarks[i];
-      if ((lm.v ?? 0) < 0.15) continue;
-      ellipse(lm.x, lm.y, 6, 6);
-    }
-  }
-
-  noFill();
-  strokeWeight(2);
-  stroke(255, 0, 0, 200);
-  beginShape();
-  for (let i = 0; i < trail.length; i++) {
-    vertex(trail[i].x, trail[i].y);
-  }
-  endShape();
-
-  if (trail.length > 0) {
-    fill(255, 200, 0);
-    noStroke();
-    ellipse(trail[trail.length - 1].x, trail[trail.length - 1].y, 10, 10);
-  }
-
-  // === 手动编辑模式显示 ===
-  if (manualEditMode && puppetTemplate) {
-    push();
-    stroke(255, 140, 0, 200);
-    strokeWeight(2);
-    for (let i = 0; i < POSE_CONNECTIONS.length; i++) {
-      const [a, b] = POSE_CONNECTIONS[i];
-      const A = puppetTemplate[a], B = puppetTemplate[b];
-      if (A && B) line(A.x, A.y, B.x, B.y);
-    }
-    
-    noStroke();
-    for (let i = 0; i < puppetTemplate.length; i++) {
-      const p = puppetTemplate[i];
-      if (!p) continue;
-      fill(i === manualSelectedIdx ? [255, 50, 50] : [255, 160, 0]);
-      ellipse(p.x, p.y, i === manualSelectedIdx ? 12 : 8, i === manualSelectedIdx ? 12 : 8);
-    }
-    
-    if (manualHoverIndex >= 0 && puppetTemplate[manualHoverIndex]) {
-      noFill();
-      stroke(255, 50, 50);
-      strokeWeight(2);
-      ellipse(puppetTemplate[manualHoverIndex].x, puppetTemplate[manualHoverIndex].y, 24, 24);
-    }
-    
-    noStroke();
-    fill(255);
-    textSize(12);
-    textAlign(LEFT, TOP);
-    text('Manual Edit: drag to move | ENTER to apply', 8, 8);
-    pop();
-  }
-
-  // === Click-to-Set 模式显示 ===
-  if (setupMode && puppetTemplate) {
-    push();
-    // 显示已设置的点（高亮关键点）
-    noStroke();
-    fill(0, 255, 100, 150);
-    for (let i = 0; i < setupPointIdx; i++) {
-      const idx = CRITICAL_POINTS[i];
-      const p = puppetTemplate[idx];
-      if (p && (p.x || p.y)) {
-        ellipse(p.x, p.y, 10, 10);
-      }
-    }
-    
-    // 显示十字光标
-    stroke(255, 200, 0, 200);
-    strokeWeight(1);
-    line(mouseX - 15, mouseY, mouseX + 15, mouseY);
-    line(mouseX, mouseY - 15, mouseX, mouseY + 15);
-    
-    noStroke();
-    fill(255, 200, 0);
-    textSize(14);
-    textAlign(CENTER, BOTTOM);
-    const currentPointName = CRITICAL_NAMES[setupPointIdx];
-    text(`${setupPointIdx + 1}/13: Click to set ${currentPointName}`, width / 2, 20);
-    
-    // 左下角显示已完成的点列表
-    fill(200, 200, 200);
-    textSize(10);
-    textAlign(LEFT, TOP);
-    let yPos = height - 100;
-    text('✓ Completed:', 10, yPos);
-    for (let i = 0; i < setupPointIdx; i++) {
-      yPos += 12;
-      text(`${i + 1}. ${CRITICAL_NAMES[i]}`, 15, yPos);
-    }
-    
-    pop();
-  }
-}
-
-// 修改 createManualControls 中的 Click-to-Set 按钮逻辑
-function createManualControls() {
-  const container = document.createElement('div');
-  container.style.position = 'fixed';
-  container.style.left = '10px';
-  container.style.bottom = '10px';
-  container.style.background = 'rgba(0,0,0,0.85)';
-  container.style.color = '#fff';
-  container.style.padding = '10px';
-  container.style.zIndex = 9999;
-  container.style.fontSize = '11px';
-  container.style.maxWidth = '350px';
-  container.style.borderRadius = '4px';
-
-  // === 第一行：模板初始化选项 ===
-  const row1 = document.createElement('div');
-  row1.style.marginBottom = '8px';
-
-  const label1 = document.createElement('span');
-  label1.textContent = '📋 Template Setup:';
-  label1.style.fontWeight = 'bold';
-  label1.style.display = 'block';
-  label1.style.marginBottom = '4px';
-  row1.appendChild(label1);
-
-  const freezeBtn = document.createElement('button');
-  freezeBtn.textContent = '1. Auto Freeze (from detect)';
-  freezeBtn.style.marginRight = '6px';
-  freezeBtn.style.marginBottom = '4px';
-  freezeBtn.style.padding = '4px 6px';
-  freezeBtn.style.background = '#445';
-  freezeBtn.onclick = () => {
-    if (!resultsForDraw?.poseLandmarks && !smoothedLandmarks) {
-      alert('❌ No pose detected. Make sure video is playing.');
-      return;
-    }
-    const src = resultsForDraw?.poseLandmarks || smoothedLandmarks;
-    puppetTemplate = copyLandmarks(src);
-    boneLengths = POSE_CONNECTIONS.map(([a,b]) => {
-      const A = puppetTemplate[a], B = puppetTemplate[b];
-      return A && B ? dist(A.x, A.y, B.x, B.y) : null;
-    });
-    console.log('✓ Auto template frozen from detection');
-    alert('✓ Template frozen from current detection.\n\nNow use Manual Edit to adjust points to match puppet image.');
-  };
-  row1.appendChild(freezeBtn);
-
-  const manualSetBtn = document.createElement('button');
-  manualSetBtn.textContent = `2. Click-to-Set (${CRITICAL_POINTS.length} points)`;
-  manualSetBtn.style.padding = '4px 6px';
-  manualSetBtn.style.background = '#544';
-  manualSetBtn.onclick = () => {
-    if (!puppetTemplate) {
-      puppetTemplate = Array(33).fill(null).map(() => ({ x: 0, y: 0, v: 1 }));
-    }
-    setupMode = !setupMode;
-    if (setupMode) setupPointIdx = 0; // 重置索引
-    manualSetBtn.style.background = setupMode ? '#655' : '#544';
-    manualSetBtn.textContent = setupMode ? `✓ Setting Mode ON (${setupPointIdx}/${CRITICAL_POINTS.length})` : `2. Click-to-Set (${CRITICAL_POINTS.length} points)`;
-    if (setupMode) {
-      console.log(`🖱️ Click-to-Set mode: Only need to set ${CRITICAL_POINTS.length} critical points`);
-      alert(`Click-to-Set Mode Active!\n\nOnly need to click ${CRITICAL_POINTS.length} critical points:\n${CRITICAL_NAMES.join(', ')}\n\nPress ENTER when done, ESC to cancel.`);
-    }
-  };
-  row1.appendChild(manualSetBtn);
-  container.appendChild(row1);
-
-  // === 第二行：对齐控制 ===
-  const row2 = document.createElement('div');
-  row2.style.marginBottom = '8px';
-
-  const label2 = document.createElement('span');
-  label2.textContent = '⚙️ Alignment:';
-  label2.style.fontWeight = 'bold';
-  label2.style.display = 'block';
-  label2.style.marginBottom = '4px';
-  row2.appendChild(label2);
-
-  const alignToggle = document.createElement('button');
-  alignToggle.textContent = `AutoAlign: ${enableAutoAlign ? 'ON' : 'OFF'}`;
-  alignToggle.style.marginRight = '6px';
-  alignToggle.style.padding = '4px 6px';
-  alignToggle.style.background = enableAutoAlign ? '#4a4' : '#a44';
-  alignToggle.onclick = () => {
-    enableAutoAlign = !enableAutoAlign;
-    alignToggle.textContent = `AutoAlign: ${enableAutoAlign ? 'ON' : 'OFF'}`;
-    alignToggle.style.background = enableAutoAlign ? '#4a4' : '#a44';
-    console.log(`AutoAlign ${enableAutoAlign ? 'enabled' : 'disabled'}`);
-  };
-  row2.appendChild(alignToggle);
-
-  const manualToggle = document.createElement('button');
-  manualToggle.textContent = 'Manual Edit';
-  manualToggle.style.padding = '4px 6px';
-  manualToggle.style.background = '#545';
-  manualToggle.onclick = () => {
-    if (!puppetTemplate) {
-      alert('❌ Must set template first! Use "Auto Freeze" or "Click-to-Set"');
-      return;
-    }
-    manualEditMode = !manualEditMode;
-    manualToggle.textContent = manualEditMode ? '✓ Editing' : 'Manual Edit';
-    manualToggle.style.background = manualEditMode ? '#655' : '#545';
-  };
-  row2.appendChild(manualToggle);
-  container.appendChild(row2);
-
-  // === 第三行：导入/导出 ===
-  const row3 = document.createElement('div');
-  row3.style.marginBottom = '8px';
-
-  const label3 = document.createElement('span');
-  label3.textContent = '💾 Save/Load:';
-  label3.style.fontWeight = 'bold';
-  label3.style.display = 'block';
-  label3.style.marginBottom = '4px';
-  row3.appendChild(label3);
-
-  const expBtn = document.createElement('button');
-  expBtn.textContent = 'Export';
-  expBtn.style.marginRight = '6px';
-  expBtn.style.padding = '4px 6px';
-  expBtn.style.background = '#445';
-  expBtn.onclick = () => {
-    if (!puppetTemplate) {
-      alert('No template to export');
-      return;
-    }
-    const data = { puppetTemplate, boneLengths };
-    const a = document.createElement('a');
-    a.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(data, null, 2));
-    a.download = `puppet_${Date.now()}.json`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    console.log('✓ Template exported');
-  };
-  row3.appendChild(expBtn);
-
-  const impInput = document.createElement('input');
-  impInput.type = 'file';
-  impInput.accept = '.json';
-  impInput.style.fontSize = '10px';
-  impInput.style.padding = '2px';
-  impInput.onchange = (ev) => {
-    const f = ev.target.files[0];
-    if (!f) return;
-    const r = new FileReader();
-    r.onload = (e) => {
-      try {
-        const obj = JSON.parse(e.target.result);
-        if (obj.puppetTemplate && Array.isArray(obj.puppetTemplate)) {
-          puppetTemplate = obj.puppetTemplate;
-          boneLengths = obj.boneLengths || null;
-          console.log('✓ Template imported');
-          alert('✓ Template imported successfully!');
-        } else {
-          alert('Invalid template format');
-        }
-      } catch (err) {
-        alert('Parse error: ' + err.message);
-      }
-    };
-    r.readAsText(f);
-  };
-  row3.appendChild(impInput);
-  container.appendChild(row3);
-
-  // === 第四行：重置 ===
-  const row4 = document.createElement('div');
-  const resetBtn = document.createElement('button');
-  resetBtn.textContent = 'Reset All';
-  resetBtn.style.padding = '4px 6px';
-  resetBtn.style.background = '#a44';
-  resetBtn.onclick = () => {
-    if (confirm('Reset all templates and settings?')) {
-      puppetTemplate = null;
-      boneLengths = null;
-      currentTransform = null;
-      setupMode = false;
-      setupPointIdx = 0;
-      manualEditMode = false;
-      enableAutoAlign = true;
-      stableFrameCount = 0;
-      console.log('✓ Reset complete');
-    }
-  };
-  row4.appendChild(resetBtn);
-  container.appendChild(row4);
-
-  // === 状态显示 ===
-  const statusDiv = document.createElement('div');
-  statusDiv.id = 'controlStatus';
-  statusDiv.style.fontSize = '10px';
-  statusDiv.style.color = '#aaa';
-  statusDiv.style.marginTop = '8px';
-  statusDiv.style.borderTop = '1px solid #555';
-  statusDiv.style.paddingTop = '4px';
-  statusDiv.textContent = '📊 Status: Ready';
-  container.appendChild(statusDiv);
-
-  document.body.appendChild(container);
-
-  setInterval(() => {
-    if (setupMode) {
-      statusDiv.textContent = `🖱️ Setup Mode: ${setupPointIdx}/${CRITICAL_POINTS.length} points set`;
-      statusDiv.style.color = '#ff9';
-      // 更新按钮显示进度
-      manualSetBtn.textContent = `✓ Setting Mode ON (${setupPointIdx}/${CRITICAL_POINTS.length})`;
-    } else if (manualEditMode) {
-      statusDiv.textContent = '✏️ Manual Edit Mode: Drag points to adjust';
-      statusDiv.style.color = '#9ff';
-    } else if (puppetTemplate) {
-      statusDiv.textContent = `✓ Template ready | AutoAlign: ${enableAutoAlign ? 'ON' : 'OFF'}`;
-      statusDiv.style.color = '#9f9';
-    } else {
-      statusDiv.textContent = 'Status: Waiting for template setup';
-      statusDiv.style.color = '#f99';
-    }
-  }, 500);
-}
-
-// 新增：Click-to-Set 模式全局变量
-let setupMode = false;
-let setupPointIdx = 0;
-
-// 修改快捷键支持
+// ============ 快捷键 ============
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    if (setupMode) {
-      setupMode = false;
-      boneLengths = POSE_CONNECTIONS.map(([a,b]) => {
-        const A = puppetTemplate[a], B = puppetTemplate[b];
-        return A && B ? dist(A.x, A.y, B.x, B.y) : null;
-      });
-      console.log('✓ Click-to-Set setup complete');
-      alert('✓ Template setup complete! Now use Manual Edit to fine-tune.');
-      setupPointIdx = 0;
-    }
+  if (e.key === 'Enter' && setupMode) {
+    setupMode = false;
+    boneLengths = POSE_CONNECTIONS.map(([a,b]) => {
+      const A = puppetTemplate[a], B = puppetTemplate[b];
+      return A && B ? dist(A.x, A.y, B.x, B.y) : null;
+    });
+    mirrorDecisionMade = false;
+    mirrorConsecutiveFrames = 0;
+    lastMirrorVote = null;
+    cachedMirrorDecision = false;
+    console.log('✓ Setup complete');
   } else if (e.key === 'Escape') {
-    if (setupMode) {
-      setupMode = false;
-      setupPointIdx = 0;
-      console.log('✗ Click-to-Set cancelled');
-    } else if (manualEditMode) {
-      manualEditMode = false;
-      console.log('✓ Manual edit exited');
-    }
-  } else if (e.key === 'd' || e.key === 'D') {
-    if (resultsForDraw?.poseLandmarks && puppetTemplate) {
-      const err = computeMatchError(resultsForDraw.poseLandmarks, puppetTemplate);
-      console.log(`📊 Alignment Error: ${err.toFixed(2)}`);
-    }
-  } else if (e.key === 'Tab' && setupMode) {
-    // TAB 键跳过当前点
-    setupPointIdx = Math.min(setupPointIdx + 1, CRITICAL_POINTS.length);
-    console.log(`⏭️ Skipped to point ${setupPointIdx}`);
+    if (setupMode) { setupMode = false; setupPointIdx = 0; }
+    else if (manualEditMode) manualEditMode = false;
+  } else if (e.key === 'r' || e.key === 'R') {
+    mirrorDecisionMade = false;
+    mirrorConsecutiveFrames = 0;
+    lastMirrorVote = null;
+    cachedMirrorDecision = false;
+    console.log('✓ Mirror decision reset, re-evaluating...');
+  } else if (e.key === 'm' || e.key === 'M') {
+    // ✨ 新增：按 M 键强制锁定当前镜像状态
+    mirrorForced = cachedMirrorDecision ? false : true;
+    console.log(`✓ Mirror ${mirrorForced ? 'FORCED to MIRRORED' : 'AUTO (toggle)'}`);
   }
 });
